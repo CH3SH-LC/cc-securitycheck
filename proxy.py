@@ -1,197 +1,183 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-cc-securitycheck —— 本地 DeepSeek 中转（Claude Code / DeepSeek flash + pro）
+"""A local Anthropic Messages relay with a narrowly scoped classifier rewrite.
 
-作用：
-  1. 把 Claude Code 的全部请求转发到 DeepSeek 的 Anthropic 兼容端点；
-  2. 安全分类器请求（auto 模式审批前的 severity 判定调用）强制 thinking disabled，
-     避免 DeepSeek 推理模型把 64/256 token 预算全烧在 thinking 上、吐不出 <severity> 结论，
-     导致分类器 fail-closed 拦截所有有副作用的工具；
-  3. 其余请求原样透传，思考强度完全跟随 Claude Code 内部的 effort 配置。
-
-依赖：仅 Python 标准库，无任何第三方包。
-配置：全部走环境变量（均有默认值），见 README.md 与 start.bat。
+UPSTREAM must explicitly name a compatible API root. Authentication, model
+selection, upstream verdicts and all other requests remain the caller's own.
+Requires only the Python standard library.
 """
 
 import http.client
 import json
+import math
 import os
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
-# ---------------------------------------------------------------------------
-# 配置（环境变量，均可缺省）
-# ---------------------------------------------------------------------------
+from classifier import rewrite_request
+
+
 HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "8008"))
-UPSTREAM = os.environ.get("UPSTREAM", "https://api.deepseek.com/anthropic")
-# 可选：统一改写 model 字段（如 "deepseek-v4-flash[1M]"）；留空则透传 CC 的 model。
-MODEL_OVERRIDE = os.environ.get("MODEL_OVERRIDE", "").strip()
-
-# 分类器判定阈值：Claude Code auto 模式分类器请求的 max_tokens 为 64/256。
-CLASSIFIER_MAX_TOKENS = 256
+UPSTREAM = os.environ.get("UPSTREAM", "").strip()
+UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "300"))
+ALLOW_SMALL_BUDGET = os.environ.get("CLASSIFIER_ALLOW_SMALL_BUDGET", "0") == "1"
 BUFFER = 8192
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection",
+}
 
 
-def _system_text(system) -> str:
-    """把 messages 请求的 system 字段（str 或 content-block 数组）拼成文本。"""
-    if isinstance(system, str):
-        return system
-    if isinstance(system, list):
-        parts = []
-        for item in system:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                t = item.get("text")
-                if isinstance(t, str):
-                    parts.append(t)
-                elif isinstance(t, list):
-                    for c in t:
-                        if isinstance(c, dict) and isinstance(c.get("text"), str):
-                            parts.append(c["text"])
-        return "\n".join(parts)
-    return ""
+def validate_upstream(value):
+    """Validate a configured HTTP(S) root without accepting embedded secrets."""
+    if not value:
+        raise ValueError("UPSTREAM is required; set it to an Anthropic Messages-compatible API root")
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("UPSTREAM must not contain whitespace or control characters")
+    if "?" in value or "#" in value or "\\" in value:
+        raise ValueError("UPSTREAM must not contain a query, fragment, or backslash")
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("UPSTREAM must be an absolute http:// or https:// API root")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("UPSTREAM must not contain credentials; use the client's auth headers")
+    # Accessing port also validates malformed and out-of-range port numbers.
+    if parsed.port == 0:
+        raise ValueError("UPSTREAM port must be between 1 and 65535")
+    return parsed
 
 
-def is_classifier(body: dict) -> bool:
-    """判定是否为 auto 模式安全分类器调用。
+def upstream_path(prefix, request_path):
+    """Join an API root and client path without duplicating a final /v1."""
+    prefix = prefix.rstrip("/")
+    route = urlsplit(request_path)
+    path = route.path
+    if prefix.endswith("/v1") and (path == "/v1" or path.startswith("/v1/")):
+        path = path[len("/v1"):]
+    return prefix + path + ("?" + route.query if "?" in request_path else "")
 
-    依据（2026-08-03 实验证实）：
-      - 分类器请求 body.max_tokens 为 64/256（远小于主模型调用，主模型用 4096+）；
-      - 或 system 提示里要求输出 <severity>N</severity>。
-    """
-    if body.get("max_tokens") is not None:
-        try:
-            if int(body["max_tokens"]) <= CLASSIFIER_MAX_TOKENS:
-                return True
-        except (TypeError, ValueError):
-            pass
-    return "severity" in _system_text(body.get("system", "")).lower()
+
+def _hop_headers(headers):
+    excluded = set(_HOP_BY_HOP)
+    for key, value in headers:
+        if key.lower() == "connection":
+            excluded.update(token.strip().lower() for token in value.split(","))
+    return excluded
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    # ---- 通用转发（所有方法） ----
-    def _forward(self):
-        # 1. 读请求体
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length else b""
-
-        # 2. 改写（仅 /v1/messages 的 JSON 请求）
-        is_cls = False
-        modified = False
-        path_no_query = self.path.split("?", 1)[0]
-        if path_no_query.rstrip("/").endswith("/v1/messages"):
-            try:
-                data = json.loads(body.decode("utf-8"))
-                if isinstance(data, dict):
-                    is_cls = is_classifier(data)
-                    if is_cls:
-                        # 分类器不推理：DeepSeek 兼容层默认开 thinking 且吃 max_tokens 预算，
-                        # 64/256 token 全烧在 thinking 上就永远吐不出 verdict。
-                        data["thinking"] = {"type": "disabled"}
-                        modified = True
-                    if MODEL_OVERRIDE:
-                        data["model"] = MODEL_OVERRIDE
-                        modified = True
-                    if modified:
-                        body = json.dumps(data).encode("utf-8")
-            except (ValueError, UnicodeDecodeError):
-                pass  # 非 JSON 或解码失败 → 原样透传
-
-        # 3. 构造上游请求
-        up = urlparse(UPSTREAM)
-        is_https = up.scheme == "https"
-        upstream_host = up.hostname
-        upstream_port = up.port or (443 if is_https else 80)
-        upstream_path = up.path.rstrip("/") + self.path
-
-        hdrs = {k: v for k, v in self.headers.items()
-                if k.lower() not in ("host", "content-length", "connection",
-                                     "transfer-encoding", "accept-encoding")}
-        hdrs["Host"] = upstream_host
-
-        Conn = http.client.HTTPSConnection if is_https else http.client.HTTPConnection
-        conn = Conn(upstream_host, upstream_port, timeout=300)
-        try:
-            conn.request(self.command, upstream_path, body=body, headers=hdrs)
-            resp = conn.getresponse()
-        except Exception as e:  # 上游不可达 → 可读的 502
-            msg = json.dumps({"type": "proxy_error",
-                              "message": "cc-securitycheck 无法连接上游 %s: %s" % (UPSTREAM, e)}).encode("utf-8")
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(msg)))
-            self.end_headers()
-            self.wfile.write(msg)
-            return
-
-        # 4. 回传响应头
-        status = resp.status
-        out_headers = {k: v for k, v in resp.getheaders()
-                       if k.lower() not in ("transfer-encoding", "connection")}
-        content_length = resp.getheader("Content-Length")
-
-        tag = "CLASSIFIER->NO_THINK" if is_cls else "PASSTHROUGH"
-        extra = " model=%s" % MODEL_OVERRIDE if MODEL_OVERRIDE else ""
-        print("[%s] %s %s -> %s%s" % (tag, self.command, path_no_query, status, extra), flush=True)
-
+    def _error(self, status, message):
+        payload = json.dumps({"type": "proxy_error", "message": message}).encode("utf-8")
+        self.close_connection = True
         self.send_response(status)
-        if content_length is not None:
-            out_headers["Content-Length"] = content_length
-            self.close_connection = False  # 长度已知，可保活
-        else:
-            # 流式/未知长度 → 关连接表示正文结束（CC 的客户端按 EOF 读 SSE）
-            self.close_connection = True
-        for k, v in out_headers.items():
-            self.send_header(k, v)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
         self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
 
-        # 5. 逐块流式回传
+    def _forward(self):
+        # The stdlib HTTP server does not decode incoming chunked bodies.
+        # Reject them explicitly instead of silently forwarding an empty body.
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._error(501, "Chunked request bodies are unsupported; send Content-Length")
+            return
+        lengths = self.headers.get_all("Content-Length", [])
         try:
-            remaining = int(content_length) if content_length is not None else -1
-            while True:
-                if remaining >= 0:
-                    if remaining <= 0:
+            if len(lengths) > 1 or (lengths and not lengths[0].isdigit()):
+                raise ValueError
+            length = int(lengths[0]) if lengths else 0
+            route = urlsplit(self.path)
+            if route.scheme or route.netloc or route.fragment or not self.path.startswith("/"):
+                raise ValueError
+        except ValueError:
+            self._error(400, "Invalid request path or Content-Length")
+            return
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            self._error(400, "Incomplete request body")
+            return
+        matched = False
+        if self.command == "POST":
+            body, matched = rewrite_request(self.path, body, ALLOW_SMALL_BUDGET)
+
+        parsed = self.server.upstream
+        headers = list(self.headers.items())
+        excluded = _hop_headers(headers) | {"host", "content-length"}
+        headers = {key: value for key, value in headers if key.lower() not in excluded}
+        # http.client generates Host (including nondefault ports) and the new
+        # Content-Length. Caller authentication and provider headers pass through.
+        connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
+        response_started = False
+        try:
+            connection.request(self.command, upstream_path(parsed.path, self.path), body=body, headers=headers)
+            response = connection.getresponse()
+            response_headers = response.getheaders()
+            excluded = _hop_headers(response_headers)
+            if response.chunked:
+                excluded.add("content-length")
+            self.close_connection = True
+            self.send_response_only(response.status, response.reason)
+            for key, value in response_headers:
+                if key.lower() not in excluded:
+                    self.send_header(key, value)
+            # http.client decodes upstream chunk framing. Closing the downstream
+            # connection frames responses that have no Content-Length, including SSE.
+            self.send_header("Connection", "close")
+            self.end_headers()
+            response_started = True
+            tag = "CLASSIFIER->NO_THINK" if matched else "PASSTHROUGH"
+            print("[%s] %s %s -> %s" % (tag, self.command, route.path, response.status), flush=True)
+            if self.command != "HEAD":
+                while True:
+                    # read() can wait to fill BUFFER and stall a small SSE event.
+                    chunk = response.read1(BUFFER)
+                    if not chunk:
                         break
-                    chunk = resp.read(min(BUFFER, remaining))
-                else:
-                    chunk = resp.read(BUFFER)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                if remaining >= 0:
-                    remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # 客户端提前断开
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except (OSError, http.client.HTTPException) as error:
+            self.close_connection = True
+            if not response_started:
+                status = 504 if isinstance(error, (TimeoutError, socket.timeout)) else 502
+                self._error(status, "Upstream request failed (%s)" % type(error).__name__)
+            else:
+                # Never append a fabricated verdict or JSON error to an SSE body.
+                print("[UPSTREAM-ERROR] response interrupted (%s)" % type(error).__name__, flush=True)
         finally:
-            conn.close()
+            connection.close()
 
     def log_message(self, *args):
-        pass  # 关闭 http.server 自带访问日志，避免刷屏
+        pass
 
-    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _forward
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _forward
 
 
 def main():
+    try:
+        upstream = validate_upstream(UPSTREAM)
+        if not math.isfinite(UPSTREAM_TIMEOUT) or UPSTREAM_TIMEOUT <= 0:
+            raise ValueError("UPSTREAM_TIMEOUT must be a positive number of seconds")
+        if not 0 < PORT <= 65535:
+            raise ValueError("PROXY_PORT must be between 1 and 65535")
+    except ValueError as error:
+        raise SystemExit("Configuration error: %s" % error)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("=" * 58, flush=True)
-    print("cc-securitycheck 本地 DeepSeek 中转已启动", flush=True)
-    print("  监听     : http://%s:%s" % (HOST, PORT), flush=True)
-    print("  上游     : %s" % UPSTREAM, flush=True)
-    print("  模型覆盖 : %s" % (MODEL_OVERRIDE or "(透传，跟随 Claude Code 配置)"), flush=True)
-    print("  分类器   : 强制 thinking disabled（不推理，直接出 verdict）", flush=True)
-    print("  其他请求 : 原样透传（思考强度跟随 CC 内部 effort 配置）", flush=True)
-    print("  CC 配置  : ANTHROPIC_BASE_URL=http://%s:%s" % (HOST, PORT), flush=True)
-    print("=" * 58, flush=True)
+    server.upstream = upstream
+    print("cc-securitycheck listening on http://%s:%s" % (HOST, PORT), flush=True)
+    print("Upstream: %s" % UPSTREAM, flush=True)
+    print("Classifier: tool-free classifier role and verdict signature; thinking disabled for matches", flush=True)
+    print("Legacy small-budget detection: %s" % ("enabled" if ALLOW_SMALL_BUDGET else "disabled"), flush=True)
+    print("All safety verdicts and model choices come from your configured upstream.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n已停止。", flush=True)
+        print("\nStopped.", flush=True)
     finally:
         server.server_close()
 

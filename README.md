@@ -1,109 +1,140 @@
 # cc-securitycheck
 
-本地 DeepSeek 中转，解决 Claude Code **auto 模式安全分类器被拦**的问题。
+A local relay that helps Claude Code's **auto-mode safety classifier return a verdict when reasoning consumes its output budget**. Python standard library only. No provider SDK or DeepSeek dependency.
 
-## 背景
+The relay sets `thinking: {"type": "disabled"}` on recognized classifier requests. The upstream model still evaluates the action, and Claude Code still enforces the result. Requests outside the classifier match retain their model, thinking settings, and body bytes.
 
-DeepSeek（V4）是推理模型，其 Anthropic 兼容层**默认开 thinking 且 thinking 消耗 max_tokens 预算**，
-与 Anthropic「不写 thinking 字段 = 不推理、预算分离」的语义不同。
+| Branch | Purpose |
+| --- | --- |
+| [`main`](https://github.com/CH3SH-LC/cc-securitycheck/tree/main) | Provider-neutral relay and reusable classifier module. You choose the upstream. |
+| [`ds`](https://github.com/CH3SH-LC/cc-securitycheck/tree/ds) | Original DeepSeek-specific version, preserved at [`6479e68`](https://github.com/CH3SH-LC/cc-securitycheck/commit/6479e68687fe6cc9cc158f3d4798bb3319c9b678). |
 
-auto 模式的安全分类器调用只给 64/256 token，effort=high 时 thinking 把预算烧光，
-吐不出 `<severity>` 结论，分类器 **fail-closed** 拦截所有有副作用的工具（Bash/Write/Edit/Agent），
-报误导性错误：`... is temporarily unavailable, so auto mode cannot determine the safety of ...`。
+## Why auto mode can fail
 
-本中转把**分类器请求的 thinking 强制关掉**，其余请求**原样透传**——思考强度完全跟随
-Claude Code 内部的 effort 配置（high 也可用了）。
+Auto mode makes separate classification requests before allowing certain tool actions. In the [original August 3 investigation](https://github.com/anthropics/claude-code/issues/74248#issuecomment-5163453620), those requests had a `max_tokens` budget of 64 or 256 and requested `<severity>N</severity>`.
 
-## 两条根因（同类症状，先判别再动手）
+On the tested DeepSeek Anthropic-compatible endpoint, reasoning consumed that small budget before the model emitted the verdict. Claude Code then failed closed. The maintainer's historical A/B test observed no verdict with thinking enabled and a short verdict with thinking disabled. Lowering effort also worked in that specific setup.
 
-auto 模式报 `... is temporarily unavailable, so auto mode cannot determine the safety of ...`
-时，背后至少有两条独立根因。**本工具只解决根因一**；根因二非本工具范围，
-但了解两者差异能让你在 1 分钟内定位问题。
+A related [community reproduction](https://github.com/deepseek-ai/DeepSeek-V3/issues/1464) reports non-streaming classifier reasoning exceeding the caller's timeout. Inspect the actual classifier response and timing to distinguish budget exhaustion from latency.
 
-### 根因一：模型侧——推理模型把分类器的 token 预算全烧在 thinking 上（本工具解决）
+This is **one cause, not a diagnosis for every auto-mode failure**. Effort behavior depends on the provider and version. Claude Code's [v2.1.154 changelog](https://github.com/anthropics/claude-code/blob/bf2323b3021c9d3db7a31e1e7d61068c3f704497/CHANGELOG.md#L4769) already records a fix for classifier reasoning exhausting output tokens. Update Claude Code and inspect current evidence before applying this workaround.
 
-- auto 模式的安全分类器是每次审批有副作用工具前的**一次独立 LLM 调用**，
-  `max_tokens` 只有 64/256，system 要求输出 `<severity>N</severity>`。
-- DeepSeek（V4）是推理模型，其 Anthropic 兼容层**默认开 thinking，且 thinking 消耗 max_tokens 预算**——
-  与 Anthropic「不写 thinking 字段 = 不推理、预算分离」的语义不同。
-- 因此 `effort=high` 时 thinking 把 64/256 token 全烧光，`<severity>` 结论永远吐不出，
-  分类器 **fail-closed** 拦截所有有副作用工具，并报误导性的 "temporarily unavailable"。
-- **时间特征：确定性**——同一输入 100% 复现，直到 effort/thinking 改变。
-- **判别信号**：切 `effort=medium`/`low` 立即恢复，即此根因；走本中转后日志出现
-  `[CLASSIFIER->NO_THINK]` 且正常出 verdict，亦可证实。
+## Compatibility
 
-### 根因二：服务端——分类器 serving 间歇性不可用（非本工具范围）
+Use this relay with an **Anthropic Messages-compatible API** that accepts `thinking: {"type": "disabled"}` for the selected classifier model, when missing verdicts are associated with reasoning consuming the output budget. Traffic must reach the relay through `ANTHROPIC_BASE_URL`.
 
-- 分类器由 `claude-opus-4-8[1m]` 之类的服务端路径承载，曾出现数小时级的**间歇性 brownout**
-  （详见 anthropics/claude-code #74248；同类 issue：#49535 #67542 #68387）。
-- **时间特征：间歇性 flapping**——同一命令在秒级间隔内成败交替，与命令内容无关；
-  分类器调用**无客户端重试/退避**，直接 fail-closed；状态页可能无反映（sub-threshold）。
-- **应对**：等待或在健康间隙操作；或临时用 `permissions.allow` 白名单绕过
-  （注意：改 `settings.json` 本身也被分类器门控，可能要多试几次）。
+Provider-neutral code does not mean universal model compatibility. [Issue #98962](https://github.com/anthropics/claude-code/issues/98962) reports Bedrock models rejecting disabled thinking with HTTP 400. This relay does not implement Bedrock signing, Vertex authentication, OpenAI API conversion, subscription authentication, or separate classifier model selection.
 
-### 一分钟判别表
+Changing classifier reasoning can change classification quality. Returning an actual verdict does not establish the same accuracy: validate both allowed and denied actions with your provider/model. Later model-specific reports in [DeepSeek issue #284](https://github.com/deepseek-ai/awesome-deepseek-agent/issues/284) prefer low reasoning over disabled thinking; this relay implements the disabled-thinking workaround only.
 
-| 判别维度 | 根因一（模型侧） | 根因二（服务端） |
-|---|---|---|
-| 时间特征 | 确定性，同一输入 100% 复现 | 间歇性，同一输入秒级成败交替 |
-| 切换 `effort=medium` | 立即恢复 | 无影响 |
-| 走本中转 | 恢复（`CLASSIFIER->NO_THINK`） | 无影响 |
-| 错误文案 | 相同 | 相同 |
+## Quick start
 
-## 文件
+Requires **Python 3.10+** and an existing working Anthropic-compatible API configuration. Replace the example URL with your provider's API root, including any prefix such as `/anthropic`. Do not include `/messages`.
 
-- `proxy.py`   —— 中转本体，仅 Python 标准库，零第三方依赖
-- `start.bat`  —— Windows 一键启动，顶部是常用配置区
+```sh
+git clone https://github.com/CH3SH-LC/cc-securitycheck.git
+cd cc-securitycheck
+```
 
-## 使用
+Start the relay in one terminal:
 
-### 1. 启动中转
+```sh
+# macOS / Linux
+UPSTREAM=https://your-provider.example/anthropic python3 proxy.py
+```
 
-```bash
+```powershell
+# Windows PowerShell
+$env:UPSTREAM = "https://your-provider.example/anthropic"
 python proxy.py
 ```
 
-或双击 `start.bat`。默认监听 `http://127.0.0.1:8008`。
+Windows users can also run `start.bat` after setting `UPSTREAM`. In a **second terminal**, keep your existing provider credentials and model settings, change the API base URL, and launch Claude Code:
 
-### 2. 配置 Claude Code，把流量指向本地中转
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8008
-ANTHROPIC_AUTH_TOKEN=<你的 DeepSeek API key>
-ANTHROPIC_MODEL=deepseek-v4-flash[1M]   # 或用 /model 切换
+```sh
+# macOS / Linux
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8008
+claude
 ```
 
-之后 CC 的所有请求都走本地中转。中转会转发你的 API key，因此**只监听 127.0.0.1，
-不要暴露到局域网/公网**。
-
-## 配置（环境变量，全部有默认值）
-
-| 变量            | 默认值                                  | 说明                                   |
-|-----------------|-----------------------------------------|----------------------------------------|
-| `PROXY_HOST`    | `127.0.0.1`                             | 监听地址                               |
-| `PROXY_PORT`    | `8008`                                  | 监听端口                               |
-| `UPSTREAM`      | `https://api.deepseek.com/anthropic`    | DeepSeek Anthropic 兼容端点            |
-| `MODEL_OVERRIDE`| 空                                      | 统一改写 model 字段；留空则透传 CC 的   |
-
-## 行为
-
-- **安全分类器请求**（`/v1/messages` 且 system 含 `severity` **或** `max_tokens <= 256`）
-  → 注入 `thinking: {"type": "disabled"}`，不推理、直接出 verdict。
-- **其余请求** → 原样透传，thinking 跟随 CC 的 effort 配置。
-
-## 验证
-
-启动后每笔请求打一行日志：
-
+```powershell
+# Windows PowerShell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8008"
+claude
 ```
+
+Keep your provider's authentication method, such as `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`. The relay forwards incoming credentials to `UPSTREAM`; it does not store keys or rewrite models. The upstream must support the model Claude Code actually selects for classification, which can differ from the conversation model.
+
+Keep the listener on loopback: it has no inbound authentication and forwards credentials. Stop it with **Ctrl+C**. To roll back, restore your previous `ANTHROPIC_BASE_URL` and restart Claude Code.
+
+## Configuration
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `UPSTREAM` | Required | Anthropic-compatible API root. No provider is selected automatically. |
+| `PROXY_HOST` | `127.0.0.1` | Listening address. |
+| `PROXY_PORT` | `8008` | Listening port. |
+| `UPSTREAM_TIMEOUT` | `300` | Upstream socket timeout in seconds. |
+| `CLASSIFIER_ALLOW_SMALL_BUDGET` | `0` | Set to `1` to also match a positive integer `max_tokens` of at most 256. |
+
+An upstream root ending in `/v1` is supported without duplicating that segment. Other path prefixes and incoming query strings are retained.
+
+### Request matching and forwarding
+
+Only JSON `POST /v1/messages` requests without tools are candidates; a trailing slash and query string are supported. Default matching requires a system instruction identifying a security/safety classifier or an autonomous-coding security monitor, together with a verdict signature: paired severity/block XML tags, an ALLOW/BLOCK output instruction, or a closing verdict tag in `stop_sequences`. String and text-block system prompts are supported. An ordinary XML-formatting instruction, the word `severity`, or a small output budget alone does not trigger the rewrite.
+
+`CLASSIFIER_ALLOW_SMALL_BUDGET=1` enables the original budget-based fallback for integrations without the signature. It also matches unrelated short-output messages without tools, so enable it only after inspecting your requests. Classifier prompts are an internal Claude Code detail and may change; unmatched requests pass through unchanged.
+
+For a match, only the `thinking` field is replaced. Other fields, including `model`, `max_tokens`, and `output_config`, remain. Other request bodies, including `/v1/messages/count_tokens`, pass through unchanged. Actual upstream verdicts, HTTP errors, and SSE bodies return to the client; the relay never manufactures an approval. Client request bodies must use `Content-Length`; chunked request uploads are rejected with HTTP 501. Chunked upstream responses, including SSE, are supported.
+
+## Reuse the core
+
+[`classifier.py`](classifier.py) is independent of the HTTP server, environment, credentials, and provider selection. Import it into an existing gateway:
+
+```python
+from classifier import rewrite_request
+
+if method == "POST":
+    forwarded_body, matched = rewrite_request(path, raw_body)
+else:
+    forwarded_body, matched = raw_body, False
+
+# Forward forwarded_body and return the upstream's actual response.
+```
+
+The result is `(body_bytes, matched)`. Unmatched or invalid JSON bodies are returned unchanged. Pass `allow_small_budget=True` to opt into the budget heuristic.
+
+## Verify and troubleshoot
+
+Logs identify rewrites and status codes without logging prompts or credentials:
+
+```text
 [CLASSIFIER->NO_THINK] POST /v1/messages -> 200
 [PASSTHROUGH] POST /v1/messages -> 200
 ```
 
-分类器请求应显示 `CLASSIFIER->NO_THINK` 并正常返回 verdict；主模型调用显示 `PASSTHROUGH`。
+These lines establish routing, **not a valid verdict or successful tool approval**. Inspect the actual classifier response and Claude Code's handling of it. Preserve genuine denials.
 
-## 模型说明
+| Classifier evidence | Action |
+| --- | --- |
+| Reasoning uses the output budget; no verdict | Compare the same request with thinking disabled on a compatible endpoint. This is the intended use. |
+| HTTP 400 rejects disabled thinking | Use the provider's supported settings. This rewrite is unsuitable. |
+| HTTP 401/403 or unknown/disallowed model | Fix authentication, access, or classifier model routing. |
+| HTTP 429/5xx, connection failure, intermittent timeout | Investigate rate limits and serving/network availability. This relay adds no retries or fallback model. |
+| Valid verdict denies the action | Review the action and permission policy; the denial is preserved. |
 
-- DeepSeek **flash 已更新到 0731 版本，当前能力反而强于 pro**，默认推荐 flash。
-- 模型名透传不改，由 CC 的 `ANTHROPIC_MODEL` / `/model` 决定；也可用 `MODEL_OVERRIDE`
-  在代理侧强制统一（如切换 flash/pro 时不用动 CC 配置）。
+Inspect `claude --debug` output locally and redact credentials, prompts, and tool arguments before sharing. The [original #74248 report](https://github.com/anthropics/claude-code/issues/74248) documents intermittent serving failures with the same visible symptom.
+
+## Development
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Tests use local fake upstream servers to check matching, body and credential forwarding, retained denials/errors, URL handling, and streaming delivery before completion. Fixtures include a reconstruction of the publicly reported request fields in [oMLX issue #1](https://github.com/phaedrus1992/omlx/issues/1), rather than a private captured prompt, and the illustrative monitor prompt from [DeepSeek issue #1464](https://github.com/deepseek-ai/DeepSeek-V3/issues/1464). They do not establish current model accuracy or live provider compatibility. The historical model experiment above is separate evidence.
+
+## Migrating from `ds`
+
+Set `UPSTREAM` explicitly; `main` has no DeepSeek default. `MODEL_OVERRIDE` is removed: configure model selection in Claude Code or your gateway. Small-budget detection is now opt-in. The [`ds` branch](https://github.com/CH3SH-LC/cc-securitycheck/tree/ds) retains the original files and behavior.
+
+MIT license. An independent community relay, not an official Anthropic plugin or a `/plugin install` package.
