@@ -76,11 +76,14 @@ def rewrite_request(path, body, allow_small_budget=False):
         if route.path not in ("/v1/messages", "/v1/messages/"):
             return body, False
         data = json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, AttributeError):
+    except (ValueError, UnicodeDecodeError, AttributeError, RecursionError):
         return body, False
     if not is_classifier(data, allow_small_budget):
         return body, False
     if data.get("thinking") == {"type": "disabled"}:
         return body, True
     data["thinking"] = {"type": "disabled"}
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+    try:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+    except (ValueError, RecursionError):
+        return body, False

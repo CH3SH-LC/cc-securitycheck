@@ -218,6 +218,15 @@ class ProxyTests(unittest.TestCase):
             request(port, body=original)
             self.assertEqual(upstream.requests.get(timeout=1)[3], original)
 
+    def test_deeply_nested_body_is_forwarded_byte_identically(self):
+        original = b"[" * 4000 + b"]" * 4000
+        with FakeUpstream() as upstream, relay(upstream.url) as port:
+            status, _, body = request(port, body=original)
+            received = upstream.requests.get(timeout=1)[3]
+        self.assertEqual(status, 200)
+        self.assertEqual(body, DENIAL)
+        self.assertEqual(received, original)
+
     def test_ordinary_bug_triage_request_with_xml_and_tools_passes_through(self):
         original = json.dumps({
             "model": "bug-triage-model",

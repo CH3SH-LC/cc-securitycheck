@@ -192,6 +192,19 @@ class ClassifierTests(unittest.TestCase):
             with self.subTest(original=original):
                 self.assertEqual(rewrite_request("/v1/messages", original), (original, False))
 
+    def test_bodies_that_cannot_be_reprocessed_are_preserved(self):
+        # A matched body can still fail to re-encode: a lone surrogate escape
+        # decodes fine but cannot be written back as UTF-8. A deeply nested body
+        # cannot be decoded at all. Both must fall back to the untouched bytes.
+        surrogate = json.dumps({
+            "system": CLASSIFIER_SYSTEM,
+            "max_tokens": 64,
+            "note": "\ud800",
+        }).encode()
+        for original in (b"[" * 4000 + b"]" * 4000, surrogate):
+            with self.subTest(original=original[:24]):
+                self.assertEqual(rewrite_request("/v1/messages", original), (original, False))
+
     def test_rewrite_exposes_opt_in_legacy_detection(self):
         original = b'{"max_tokens":64,"model":"unchanged"}'
         body, matched = rewrite_request("/v1/messages", original, allow_small_budget=True)
