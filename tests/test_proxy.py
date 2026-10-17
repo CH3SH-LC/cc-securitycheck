@@ -290,6 +290,35 @@ class ProxyTests(unittest.TestCase):
                 request(port)
                 self.assertEqual(upstream.requests.get(timeout=1)[1], prefix.rstrip("/") + "/messages")
 
+    def test_non_ascii_request_target_is_rejected_with_a_proxy_error(self):
+        # The target arrives latin-1 decoded, so a byte >= 0x80 survives and
+        # http.client cannot ASCII-encode the request line. The relay must
+        # answer with the same 400 as every other malformed target instead of
+        # dropping the connection.
+        body = b'{"model":"m","max_tokens":64}'
+        raw = (
+            b"POST /v1/messag\xc3\xa9 HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        with FakeUpstream() as upstream, relay(upstream.url) as port:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+                sock.sendall(raw)
+                received = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    received += chunk
+            forwarded = not upstream.requests.empty()
+        head, _, payload = received.partition(b"\r\n\r\n")
+        self.assertEqual(head.split(b"\r\n", 1)[0], b"HTTP/1.1 400 Bad Request")
+        self.assertEqual(
+            json.loads(payload),
+            {"type": "proxy_error", "message": "Invalid request path or Content-Length"},
+        )
+        self.assertFalse(forwarded, "relay forwarded a non-ASCII request target")
+
     def test_small_budget_compatibility_option_is_explicit(self):
         original = b'{"model":"same","max_tokens":64,"thinking":{"type":"adaptive"}}'
         with FakeUpstream() as upstream, relay(upstream.url, CLASSIFIER_ALLOW_SMALL_BUDGET="1") as port:
