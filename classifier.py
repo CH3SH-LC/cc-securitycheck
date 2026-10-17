@@ -6,8 +6,8 @@ from urllib.parse import urlsplit
 
 
 CLASSIFIER_MAX_TOKENS = 256
-_SEVERITY_VERDICT = re.compile(r"<severity\s*>.*?</severity\s*>", re.I | re.S)
-_BLOCK_VERDICT = re.compile(r"<block\s*>.*?</block\s*>", re.I | re.S)
+_SEVERITY_VERDICT = re.compile(r"<severity\s*>.{0,256}?</severity\s*>", re.I | re.S)
+_BLOCK_VERDICT = re.compile(r"<block\s*>.{0,256}?</block\s*>", re.I | re.S)
 _BINARY_VERDICT = re.compile(r"\bALLOW\s*(?:\bor\b|/)\s*BLOCK\b", re.I)
 _CLASSIFIER_IDENTITY = re.compile(
     r"\b(?:security|safety)\s+classifier\b"
@@ -47,12 +47,13 @@ def is_classifier(body, allow_small_budget=False):
         isinstance(stop, str) and stop in ("</severity>", "</block>")
         for stop in stops
     )
-    verdict_text = any(
-        pattern.search(system)
-        for pattern in (_SEVERITY_VERDICT, _BLOCK_VERDICT, _BINARY_VERDICT)
-    )
-    if _CLASSIFIER_IDENTITY.search(system) and (verdict_text or verdict_stop):
-        return True
+    if _CLASSIFIER_IDENTITY.search(system):
+        verdict_text = any(
+            pattern.search(system)
+            for pattern in (_SEVERITY_VERDICT, _BLOCK_VERDICT, _BINARY_VERDICT)
+        )
+        if verdict_text or verdict_stop:
+            return True
     budget = body.get("max_tokens")
     return bool(
         allow_small_budget
