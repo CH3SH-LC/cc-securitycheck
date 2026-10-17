@@ -92,7 +92,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
             length = int(lengths[0]) if lengths else 0
             route = urlsplit(self.path)
-            if route.scheme or route.netloc or route.fragment or not self.path.startswith("/"):
+            if (route.scheme or route.netloc or route.fragment
+                    or not self.path.startswith("/") or not self.path.isascii()):
                 raise ValueError
         except ValueError:
             self._error(400, "Invalid request path or Content-Length")

@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import sys
+import time
 import unittest
 
 
@@ -71,6 +72,20 @@ class ClassifierTests(unittest.TestCase):
         ):
             with self.subTest(system=system):
                 self.assertFalse(is_classifier({"system": system, "max_tokens": 2112}))
+
+    def test_repeated_unclosed_verdict_tags_stay_fast(self):
+        # An opening tag that never closes used to make the lazy verdict regex
+        # rescan to the end of the system text at every occurrence, so a body
+        # could pin the relay's CPU thread. The bound is generous: the fixed
+        # scan is milliseconds and the old one took seconds on this input.
+        for system in (
+            "<severity>" * 16000,
+            "You are a security classifier. " + "<block>" * 16000,
+        ):
+            with self.subTest(system=system[:48]):
+                started = time.monotonic()
+                is_classifier({"system": system, "max_tokens": 2112})
+                self.assertLess(time.monotonic() - started, 1.0)
 
     def test_illustrative_reported_classifier_supports_high_budget(self):
         # Reported shape: 2112 tokens, non-streaming, no thinking field/tools.
@@ -190,6 +205,19 @@ class ClassifierTests(unittest.TestCase):
     def test_invalid_json_and_nonobject_json_are_preserved(self):
         for original in (b"", b"{bad json", b"\xff", b"null", b"[]", b'"hello"', b"64"):
             with self.subTest(original=original):
+                self.assertEqual(rewrite_request("/v1/messages", original), (original, False))
+
+    def test_bodies_that_cannot_be_reprocessed_are_preserved(self):
+        # A matched body can still fail to re-encode: a lone surrogate escape
+        # decodes fine but cannot be written back as UTF-8. A deeply nested body
+        # cannot be decoded at all. Both must fall back to the untouched bytes.
+        surrogate = json.dumps({
+            "system": CLASSIFIER_SYSTEM,
+            "max_tokens": 64,
+            "note": "\ud800",
+        }).encode()
+        for original in (b"[" * 4000 + b"]" * 4000, surrogate):
+            with self.subTest(original=original[:24]):
                 self.assertEqual(rewrite_request("/v1/messages", original), (original, False))
 
     def test_rewrite_exposes_opt_in_legacy_detection(self):
