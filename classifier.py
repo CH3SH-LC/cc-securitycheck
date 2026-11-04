@@ -6,8 +6,10 @@ from urllib.parse import urlsplit
 
 
 CLASSIFIER_MAX_TOKENS = 256
-_SEVERITY_VERDICT = re.compile(r"<severity\s*>.{0,256}?</severity\s*>", re.I | re.S)
-_BLOCK_VERDICT = re.compile(r"<block\s*>.{0,256}?</block\s*>", re.I | re.S)
+_XML_VERDICTS = (
+    (re.compile(r"<severity\s*>", re.I), re.compile(r"</severity\s*>", re.I)),
+    (re.compile(r"<block\s*>", re.I), re.compile(r"</block\s*>", re.I)),
+)
 _BINARY_VERDICT = re.compile(r"\bALLOW\s*(?:\bor\b|/)\s*BLOCK\b", re.I)
 _CLASSIFIER_IDENTITY = re.compile(
     r"\b(?:security|safety)\s+classifier\b"
@@ -30,6 +32,17 @@ def _system_text(system):
     return ""
 
 
+def _has_xml_verdict(system):
+    # A closer after any opener is also after the first opener. Searching each
+    # delimiter once preserves the original unlimited, case-insensitive DOTALL
+    # match without rescanning the suffix for every unclosed opening tag.
+    for opening, closing in _XML_VERDICTS:
+        first = opening.search(system)
+        if first is not None and closing.search(system, first.end()) is not None:
+            return True
+    return False
+
+
 def is_classifier(body, allow_small_budget=False):
     """Recognize a tool-free security classifier role and verdict format.
 
@@ -48,10 +61,7 @@ def is_classifier(body, allow_small_budget=False):
         for stop in stops
     )
     if _CLASSIFIER_IDENTITY.search(system):
-        verdict_text = any(
-            pattern.search(system)
-            for pattern in (_SEVERITY_VERDICT, _BLOCK_VERDICT, _BINARY_VERDICT)
-        )
+        verdict_text = _has_xml_verdict(system) or _BINARY_VERDICT.search(system)
         if verdict_text or verdict_stop:
             return True
     budget = body.get("max_tokens")

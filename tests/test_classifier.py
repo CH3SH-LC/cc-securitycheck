@@ -1,9 +1,11 @@
 """Offline contract tests for the provider-neutral request transformation."""
 
 import json
+from itertools import product
 from pathlib import Path
+import re
+import subprocess
 import sys
-import time
 import unittest
 
 
@@ -74,18 +76,60 @@ class ClassifierTests(unittest.TestCase):
                 self.assertFalse(is_classifier({"system": system, "max_tokens": 2112}))
 
     def test_repeated_unclosed_verdict_tags_stay_fast(self):
-        # An opening tag that never closes used to make the lazy verdict regex
-        # rescan to the end of the system text at every occurrence, so a body
-        # could pin the relay's CPU thread. The bound is generous: the fixed
-        # scan is milliseconds and the old one took seconds on this input.
-        for system in (
-            "<severity>" * 16000,
-            "You are a security classifier. " + "<block>" * 16000,
-        ):
-            with self.subTest(system=system[:48]):
-                started = time.monotonic()
-                is_classifier({"system": system, "max_tokens": 2112})
-                self.assertLess(time.monotonic() - started, 1.0)
+        # Exercise both tag scanners with an identity, plus the no-identity
+        # shortcut. A subprocess timeout bounds the suite even if the quadratic
+        # scan returns; the complete fixed workload takes well under a second.
+        code = """
+from classifier import is_classifier
+for count in (16000, 64000):
+    for tag in ('severity', 'block'):
+        for identity in ('', 'You are a security classifier. '):
+            system = identity + ('<' + tag + '>') * count
+            assert not is_classifier({'system': system, 'max_tokens': 2112})
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+
+    def test_xml_verdict_content_has_no_length_limit(self):
+        for tag in ("severity", "block"):
+            for length in (0, 1, 255, 256, 257, 65536):
+                with self.subTest(tag=tag, length=length):
+                    original = {
+                        "system": "You are a security classifier. <" + tag + ">"
+                        + "x" * length + "</" + tag + ">",
+                        "thinking": {"type": "adaptive"},
+                    }
+                    body, matched = rewrite_request("/v1/messages", json.dumps(original).encode())
+                    self.assertTrue(matched)
+                    self.assertEqual(json.loads(body), dict(original, thinking={"type": "disabled"}))
+
+    def test_xml_recognition_matches_original_regex_semantics(self):
+        # An independent oracle pins the original boolean contract, including
+        # malformed/nested ordering, Unicode IGNORECASE, Unicode whitespace,
+        # newlines and NULs in unlimited tag contents. The corpus stays small
+        # enough that the original quadratic expressions are cheap to evaluate.
+        original_patterns = (
+            re.compile(r"<severity\s*>.*?</severity\s*>", re.I | re.S),
+            re.compile(r"<block\s*>.*?</block\s*>", re.I | re.S),
+        )
+        pieces = (
+            "<severity>", "</severity>", "<block>", "</block>",
+            "<SEVERITY\t>", "</SeVeRiTy\n>", "<BlocK\u00a0>", "</BLOCK\u2003>",
+            "<\u017fever\u0131ty>", "</\u017fEVER\u0130TY>", "<bloc\u212a>", "</BLOC\u212a>",
+            "<severity attribute=x>", "</severity x>", "<block", "</block", "\n\x00x",
+        )
+        for count in (1, 2, 3):
+            for parts in product(pieces, repeat=count):
+                text = "".join(parts)
+                expected = any(pattern.search(text) for pattern in original_patterns)
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        is_classifier({"system": "You are a safety classifier. " + text}),
+                        expected,
+                    )
 
     def test_illustrative_reported_classifier_supports_high_budget(self):
         # Reported shape: 2112 tokens, non-streaming, no thinking field/tools.
@@ -211,14 +255,32 @@ class ClassifierTests(unittest.TestCase):
         # A matched body can still fail to re-encode: a lone surrogate escape
         # decodes fine but cannot be written back as UTF-8. A deeply nested body
         # cannot be decoded at all. Both must fall back to the untouched bytes.
-        surrogate = json.dumps({
+        surrogates = [json.dumps({
             "system": CLASSIFIER_SYSTEM,
             "max_tokens": 64,
-            "note": "\ud800",
-        }).encode()
-        for original in (b"[" * 4000 + b"]" * 4000, surrogate):
+            "note": value,
+        }).encode() for value in ("\ud800", "\udfff", "prefix\ud800suffix")]
+        for original in [b"[" * 4000 + b"]" * 4000] + surrogates:
             with self.subTest(original=original[:24]):
                 self.assertEqual(rewrite_request("/v1/messages", original), (original, False))
+
+    def test_already_disabled_body_with_surrogate_keeps_its_bytes(self):
+        original = json.dumps({
+            "system": CLASSIFIER_SYSTEM, "note": "\ud800",
+            "thinking": {"type": "disabled"},
+        }, indent=2).encode() + b"\n"
+        self.assertEqual(rewrite_request("/v1/messages", original), (original, True))
+
+    def test_valid_unicode_still_uses_original_utf8_serialization(self):
+        request = {"system": CLASSIFIER_SYSTEM, "note": "\u6d4b\u8bd5\U0001f600"}
+        expected = json.dumps(
+            dict(request, thinking={"type": "disabled"}),
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        for ensure_ascii in (True, False):
+            with self.subTest(ensure_ascii=ensure_ascii):
+                original = json.dumps(request, ensure_ascii=ensure_ascii).encode("utf-8")
+                self.assertEqual(rewrite_request("/v1/messages", original), (expected, True))
 
     def test_rewrite_exposes_opt_in_legacy_detection(self):
         original = b'{"max_tokens":64,"model":"unchanged"}'
