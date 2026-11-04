@@ -6,8 +6,10 @@ from urllib.parse import urlsplit
 
 
 CLASSIFIER_MAX_TOKENS = 256
-_SEVERITY_VERDICT = re.compile(r"<severity\s*>.*?</severity\s*>", re.I | re.S)
-_BLOCK_VERDICT = re.compile(r"<block\s*>.*?</block\s*>", re.I | re.S)
+_XML_VERDICTS = (
+    (re.compile(r"<severity\s*>", re.I), re.compile(r"</severity\s*>", re.I)),
+    (re.compile(r"<block\s*>", re.I), re.compile(r"</block\s*>", re.I)),
+)
 _BINARY_VERDICT = re.compile(r"\bALLOW\s*(?:\bor\b|/)\s*BLOCK\b", re.I)
 _CLASSIFIER_IDENTITY = re.compile(
     r"\b(?:security|safety)\s+classifier\b"
@@ -30,6 +32,17 @@ def _system_text(system):
     return ""
 
 
+def _has_xml_verdict(system):
+    # A closer after any opener is also after the first opener. Searching each
+    # delimiter once preserves the original unlimited, case-insensitive DOTALL
+    # match without rescanning the suffix for every unclosed opening tag.
+    for opening, closing in _XML_VERDICTS:
+        first = opening.search(system)
+        if first is not None and closing.search(system, first.end()) is not None:
+            return True
+    return False
+
+
 def is_classifier(body, allow_small_budget=False):
     """Recognize a tool-free security classifier role and verdict format.
 
@@ -47,12 +60,10 @@ def is_classifier(body, allow_small_budget=False):
         isinstance(stop, str) and stop in ("</severity>", "</block>")
         for stop in stops
     )
-    verdict_text = any(
-        pattern.search(system)
-        for pattern in (_SEVERITY_VERDICT, _BLOCK_VERDICT, _BINARY_VERDICT)
-    )
-    if _CLASSIFIER_IDENTITY.search(system) and (verdict_text or verdict_stop):
-        return True
+    if _CLASSIFIER_IDENTITY.search(system):
+        verdict_text = _has_xml_verdict(system) or _BINARY_VERDICT.search(system)
+        if verdict_text or verdict_stop:
+            return True
     budget = body.get("max_tokens")
     return bool(
         allow_small_budget
@@ -76,11 +87,14 @@ def rewrite_request(path, body, allow_small_budget=False):
         if route.path not in ("/v1/messages", "/v1/messages/"):
             return body, False
         data = json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, AttributeError):
+    except (ValueError, UnicodeDecodeError, AttributeError, RecursionError):
         return body, False
     if not is_classifier(data, allow_small_budget):
         return body, False
     if data.get("thinking") == {"type": "disabled"}:
         return body, True
     data["thinking"] = {"type": "disabled"}
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+    try:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+    except (ValueError, RecursionError):
+        return body, False

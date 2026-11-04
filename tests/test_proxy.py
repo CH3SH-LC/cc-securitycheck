@@ -218,6 +218,82 @@ class ProxyTests(unittest.TestCase):
             request(port, body=original)
             self.assertEqual(upstream.requests.get(timeout=1)[3], original)
 
+    def test_deeply_nested_body_is_forwarded_byte_identically(self):
+        original = b"[" * 4000 + b"]" * 4000
+        with FakeUpstream() as upstream, relay(upstream.url) as port:
+            status, response_headers, body = request(port, body=original)
+            _, _, received_headers, received = upstream.requests.get(timeout=1)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, DENIAL)
+        self.assertEqual(received, original)
+        self.assertEqual(int(received_headers["Content-Length"]), len(original))
+        self.assertEqual(int(response_headers["Content-Length"]), len(DENIAL))
+
+    def test_unencodable_matched_bodies_are_forwarded_byte_identically(self):
+        # These legal JSON escapes cannot be re-encoded as UTF-8 after a
+        # rewrite. Exercise the real relay, not just the pure transformation.
+        with FakeUpstream() as upstream, relay(upstream.url) as port:
+            for surrogate in ("\ud800", "\udfff"):
+                with self.subTest(surrogate=ascii(surrogate)):
+                    data = dict(json.loads(CLASSIFIER_BODY), note=surrogate)
+                    original = json.dumps(data, indent=2).encode() + b"\n"
+                    status, response_headers, body = request(port, body=original)
+                    _, path, received_headers, received = upstream.requests.get(timeout=1)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(body, DENIAL)
+                    self.assertEqual(path, "/v1/messages")
+                    self.assertEqual(received, original)
+                    self.assertEqual(int(received_headers["Content-Length"]), len(original))
+                    self.assertEqual(int(response_headers["Content-Length"]), len(DENIAL))
+
+    def test_long_xml_verdict_preserves_rewrite_auth_and_upstream_denial(self):
+        headers = {
+            "Content-Type": "application/json", "Authorization": "Bearer offline-test-only",
+            "X-Api-Key": "offline-test-only", "Anthropic-Version": "2023-06-01",
+        }
+        with FakeUpstream() as upstream, relay(upstream.url + "/anthropic") as port:
+            for tag in ("severity", "block"):
+                for size in (257, 4096):
+                    with self.subTest(tag=tag, size=size):
+                        data = dict(json.loads(CLASSIFIER_BODY))
+                        data["system"] = (
+                            "You are a security classifier. "
+                            + "<%s>" % tag + "x" * size + "</%s>" % tag
+                        )
+                        data["messages"] = [{"role": "user", "content": "\u4e2d\u6587 \U0001f642"}]
+                        original = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+                        status, _, body = request(port, body=original, headers=headers)
+                        method, path, received_headers, received = upstream.requests.get(timeout=1)
+                        self.assertEqual((status, body), (200, DENIAL))
+                        self.assertEqual((method, path), ("POST", "/anthropic/v1/messages"))
+                        lower_headers = {key.lower(): value for key, value in received_headers.items()}
+                        for key, value in headers.items():
+                            self.assertEqual(lower_headers[key.lower()], value)
+                        expected = dict(data, thinking={"type": "disabled"})
+                        self.assertEqual(json.loads(received), expected)
+                        self.assertEqual(received, json.dumps(
+                            expected, ensure_ascii=False, separators=(",", ":")
+                        ).encode("utf-8"))
+                        self.assertEqual(int(lower_headers["content-length"]), len(received))
+
+    def test_repeated_unclosed_tags_with_identity_forward_promptly(self):
+        # Including the identity prevents its short-circuit from hiding a slow
+        # XML scan. The HTTP timeout bounds a regression in the subprocess.
+        with FakeUpstream() as upstream, relay(upstream.url) as port:
+            for tag in ("severity", "block"):
+                with self.subTest(tag=tag):
+                    original = json.dumps({
+                        "system": "You are a security classifier. " + ("<%s>" % tag) * 16000,
+                        "max_tokens": 2112,
+                        "thinking": {"type": "adaptive"},
+                    }).encode()
+                    started = time.monotonic()
+                    status, _, body = request(port, body=original)
+                    elapsed = time.monotonic() - started
+                    self.assertEqual((status, body), (200, DENIAL))
+                    self.assertEqual(upstream.requests.get(timeout=1)[3], original)
+                    self.assertLess(elapsed, 2.0)
+
     def test_ordinary_bug_triage_request_with_xml_and_tools_passes_through(self):
         original = json.dumps({
             "model": "bug-triage-model",
@@ -280,6 +356,47 @@ class ProxyTests(unittest.TestCase):
             with self.subTest(prefix=prefix), FakeUpstream() as upstream, relay(upstream.url + prefix) as port:
                 request(port)
                 self.assertEqual(upstream.requests.get(timeout=1)[1], prefix.rstrip("/") + "/messages")
+
+    def test_non_ascii_request_target_is_rejected_with_a_proxy_error(self):
+        # The target arrives latin-1 decoded, so a byte >= 0x80 survives and
+        # http.client cannot ASCII-encode the request line. The relay must
+        # answer with the same 400 as every other malformed target instead of
+        # dropping the connection.
+        body = b'{"model":"m","max_tokens":64}'
+        with FakeUpstream() as upstream, relay(upstream.url) as port:
+            for target in (b"/v1/messag\xc3\xa9", b"/v1/\xff", b"/v1/messages?name=\xc3\xa9"):
+                with self.subTest(target=target):
+                    raw = (
+                        b"POST " + target + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+                    with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+                        sock.sendall(raw)
+                        received = b""
+                        while True:
+                            chunk = sock.recv(4096)
+                            if not chunk:
+                                break
+                            received += chunk
+                    head, _, payload = received.partition(b"\r\n\r\n")
+                    self.assertEqual(head.split(b"\r\n", 1)[0], b"HTTP/1.1 400 Bad Request")
+                    self.assertEqual(
+                        json.loads(payload),
+                        {"type": "proxy_error", "message": "Invalid request path or Content-Length"},
+                    )
+                    self.assertTrue(upstream.requests.empty(), "relay forwarded a non-ASCII request target")
+
+    def test_percent_encoded_request_targets_are_preserved(self):
+        original = b'{ "model":"user-selected", "max_tokens":4096 }\n'
+        with FakeUpstream() as upstream, relay(upstream.url + "/anthropic") as port:
+            for path in ("/v1/messag%C3%A9", "/v1/messages?name=%E4%B8%AD&value=a%2Fb"):
+                with self.subTest(path=path):
+                    status, _, body = request(port, body=original, path=path)
+                    _, received_path, _, received_body = upstream.requests.get(timeout=1)
+                    self.assertEqual((status, body), (200, DENIAL))
+                    self.assertEqual(received_path, "/anthropic" + path)
+                    self.assertEqual(received_body, original)
 
     def test_small_budget_compatibility_option_is_explicit(self):
         original = b'{"model":"same","max_tokens":64,"thinking":{"type":"adaptive"}}'

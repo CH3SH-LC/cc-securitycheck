@@ -87,6 +87,8 @@ Only JSON `POST /v1/messages` requests without tools are candidates; a trailing 
 
 For a match, only the `thinking` field is replaced. Other fields, including `model`, `max_tokens`, and `output_config`, remain. Other request bodies, including `/v1/messages/count_tokens`, pass through unchanged. Actual upstream verdicts, HTTP errors, and SSE bodies return to the client; the relay never manufactures an approval. Client request bodies must use `Content-Length`; chunked request uploads are rejected with HTTP 501. Chunked upstream responses, including SSE, are supported.
 
+XML verdict contents have no length limit; unmatched opening tags are scanned without repeatedly rescanning the remaining prompt. Raw non-ASCII request paths or query strings receive HTTP 400; use percent-encoded URLs for those characters.
+
 ## Reuse the core
 
 [`classifier.py`](classifier.py) is independent of the HTTP server, environment, credentials, and provider selection. Import it into an existing gateway:
@@ -102,7 +104,7 @@ else:
 # Forward forwarded_body and return the upstream's actual response.
 ```
 
-The result is `(body_bytes, matched)`. Unmatched or invalid JSON bodies are returned unchanged. Pass `allow_small_budget=True` to opt into the budget heuristic.
+The result is `(body_bytes, matched)`. Unmatched or invalid JSON bodies are returned unchanged. Bodies that exceed the JSON nesting limit or cannot be re-encoded as UTF-8 are also forwarded unchanged. Pass `allow_small_budget=True` to opt into the budget heuristic.
 
 ## Verify and troubleshoot
 
